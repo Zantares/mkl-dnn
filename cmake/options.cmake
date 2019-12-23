@@ -47,7 +47,8 @@ option(WITH_EXAMPLE "builds examples"  ON)
 option(WITH_TEST "builds tests" ON)
 
 set(MKLDNN_THREADING "OMP" CACHE STRING
-    "specifies threading type; supports OMP (default), OMP:COMP, OMP:INTEL, or TBB.
+    "specifies threading type; supports:
+    OMP (default), OMP:COMP, OMP:INTEL, TBB, or Eigen.
 
     When OpenMP is used a user can choose what runtime to use:
     - native OpenMP runtime that comes with the compiler (OMP:COMP), or
