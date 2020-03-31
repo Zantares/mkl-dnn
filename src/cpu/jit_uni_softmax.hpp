@@ -25,6 +25,7 @@
 
 #include "cpu_isa_traits.hpp"
 #include "cpu_softmax_pd.hpp"
+#include "jit_avx512_core_bf16cvt.hpp"
 
 namespace dnnl {
 namespace impl {
@@ -38,22 +39,22 @@ struct driver_t;
 template <cpu_isa_t isa>
 struct jit_uni_softmax_fwd_t : public primitive_impl_t {
     struct pd_t : public cpu_softmax_fwd_pd_t {
-        pd_t(engine_t *engine, const softmax_desc_t *adesc,
-                const primitive_attr_t *attr,
-                const softmax_fwd_pd_t *hint_fwd_pd)
-            : cpu_softmax_fwd_pd_t(engine, adesc, attr, hint_fwd_pd) {}
+        using cpu_softmax_fwd_pd_t::cpu_softmax_fwd_pd_t;
 
         DECLARE_COMMON_PD_T(
                 JIT_IMPL_NAME_HELPER("jit:", isa, ""), jit_uni_softmax_fwd_t);
 
         status_t init() {
+            const memory_desc_wrapper data_d(src_md());
+            auto data_type = data_d.data_type();
             auto is_dense = [&]() {
-                const memory_desc_wrapper data_d(src_md());
                 const auto &bd = data_d.blocking_desc();
 
                 if (!data_d.is_dense(true) || !data_d.only_padded_dim(axis()))
                     return false;
 
+                // It is fine to use float here as the kernel uses halfs of
+                // vector registers.
                 const auto blk_size = cpu_isa_traits<isa>::vlen / sizeof(float);
                 if (data_d.is_plain())
                     return bd.strides[axis()] == 1;
@@ -68,7 +69,14 @@ struct jit_uni_softmax_fwd_t : public primitive_impl_t {
             };
 
             bool ok = true && mayiuse(isa) && is_fwd() && !has_zero_dim_memory()
-                    && src_md()->data_type == data_type::f32
+                    && (data_type == data_type::f32
+                            || IMPLICATION(data_type == data_type::bf16,
+                                    // extra check for isa is required because
+                                    // the avx512_common version may reject a
+                                    // problem because it is blocked by 8
+                                    // instead of 16.
+                                    isa >= avx512_common
+                                            && mayiuse(avx512_core)))
                     && is_dense() // not dense impl can be easily done
                     && attr()->has_default_values();
             if (!ok) return status::unimplemented;
@@ -80,7 +88,66 @@ struct jit_uni_softmax_fwd_t : public primitive_impl_t {
     jit_uni_softmax_fwd_t(const pd_t *apd);
     ~jit_uni_softmax_fwd_t();
 
-    typedef float data_t;
+    virtual status_t execute(const exec_ctx_t &ctx) const override;
+
+private:
+    const pd_t *pd() const { return (const pd_t *)primitive_impl_t::pd(); }
+    softmax_impl::driver_t<isa> *softmax_driver_;
+};
+
+template <cpu_isa_t isa>
+struct jit_uni_softmax_bwd_t : public primitive_impl_t {
+    struct pd_t : public cpu_softmax_bwd_pd_t {
+        using cpu_softmax_bwd_pd_t::cpu_softmax_bwd_pd_t;
+
+        DECLARE_COMMON_PD_T(
+                JIT_IMPL_NAME_HELPER("jit:", isa, ""), jit_uni_softmax_bwd_t);
+
+        status_t init() {
+            const memory_desc_wrapper data_d(dst_md());
+            auto data_type = data_d.data_type();
+            auto is_dense = [&]() {
+                const auto &bd = data_d.blocking_desc();
+
+                if (!data_d.is_dense(true) || !data_d.only_padded_dim(axis()))
+                    return false;
+
+                // It is fine to use float here as the kernel uses halfs of
+                // vector registers.
+                const auto blk_size = cpu_isa_traits<isa>::vlen / sizeof(float);
+                if (data_d.is_plain())
+                    return bd.strides[axis()] == 1;
+                else {
+                    // 31 is a general limit, 2 is for unroll_regs_ = 4;
+                    const size_t max_stride = (1LL << (31 - 2)) - 1;
+                    const int last_blk = bd.inner_nblks - 1;
+                    return true && bd.inner_blks[last_blk] == blk_size
+                            && bd.inner_idxs[last_blk] == axis()
+                            && sizeof(float) * bd.strides[axis()] < max_stride;
+                }
+            };
+
+            bool ok = true && mayiuse(isa) && !is_fwd()
+                    && !has_zero_dim_memory()
+                    && (data_type == data_type::f32
+                            || IMPLICATION(data_type == data_type::bf16,
+                                    // extra check for isa is required because
+                                    // the avx512_common version may reject a
+                                    // problem because it is blocked by 8
+                                    // instead of 16.
+                                    isa >= avx512_common
+                                            && mayiuse(avx512_core)))
+                    && is_dense() // not dense impl can be easily done
+                    && set_default_formats_common()
+                    && attr()->has_default_values();
+            if (!ok || ::getenv("FORCE_REF")) return status::unimplemented;
+
+            return status::success;
+        };
+    };
+
+    jit_uni_softmax_bwd_t(const pd_t *apd);
+    ~jit_uni_softmax_bwd_t();
 
     virtual status_t execute(const exec_ctx_t &ctx) const override;
 
